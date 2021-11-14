@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+        <meta name="description" content="" />
+        <meta name="author" content="Арен Елчинян" />
+        <title>Hello from x86!</title>
+        <!-- Favicon-->
+        <link rel="icon" type="image/x-icon" href="https://0nera.github.io/assets/favicon.ico" />
+        <!-- CSS-->
+        <link href="https://0nera.github.io/osdev/styles.css" rel="stylesheet" />
+
+    </head>
+    <body>
+        <h1><a href="https://0nera.github.io">/</a> <a href="https://0nera.github.io/osdev">OSDEV</a> / Hello from x86!</h1>
+        <p>Для начала знакомства с созданием операционной системы, мы создадим простейшую ОС выводящую текст</p>
+        
+        <div id="">
+            <h3>Установка</h3>
+            <p>Для начала установим GCC</p>
+            <p>Для пользователей Linux:</p>
+            <p><a href="https://github.com/lordmilko/i686-elf-tools/releases">Все релизы</a></p>
+            <p>При скачивании выбираем: i686-elf-tools-linux.zip</p>
+
+            <p>Для пользователей Windows:</p>
+            <p>Нам нужен особый gcc:</p>
+            <p><a href="https://github.com/lordmilko/i686-elf-tools/releases">Все релизы</a></p>
+            <p>При скачивании выбираем: i686-elf-tools-windows.zip</p>
+
+            <p>Добавьте папку bin из архива в path</p>
+
+            <p>Также установите <a href="https://qemu.org">Qemu</a> для запуска ОС</p>
+
+            <h3>Написание linker script</h3>
+            <p>Перед тем как начать писать основной код, мы создадим файл указывающий линкеру некоторые важные данные.</p>
+            <p>
+                <xmp>
+/* С метки _start мы будем грузиться */
+ENTRY (_start)
+
+SECTIONS
+{
+        . = 0x00100000;
+    /* Ядро будет находиться в 3GB + 1MB в виртуальном адресном пространстве, */
+    /* который будет отображен на 1 МБ в физическом адресном пространстве. */
+    /* Обратите внимание, что мы выравниваем разделы по страницам. */
+
+    _kernel_start = .;
+        .multiboot.data : {
+            *(.multiboot.data)
+        }
+
+       .multiboot.text : {
+           *(.multiboot.text)
+       }
+
+    . += 0xC0000000;
+    /* Добавляем символ, указывающий начальный адрес ядра. */
+    .text ALIGN (4K) : AT (ADDR (.text) - 0xC0000000)
+    {
+        *(.text)
+    }
+    .rodata ALIGN (4K) : AT (ADDR (.rodata) - 0xC0000000)
+    {
+        *(.rodata)
+    }
+    .data ALIGN (4K) : AT (ADDR (.data) - 0xC0000000)
+    {
+        *(.data)
+    }
+    .bss ALIGN (4K) : AT (ADDR (.bss) - 0xC0000000)
+    {
+        *(COMMON)
+        *(.bss)
+        *(.bootstrap_stack)
+    }
+    /* Добавляем символ, указывающий конечный адрес ядра. */
+    _kernel_end = .;
+}
+                </xmp>
+            </p>
+
+            <h3>Подзагрузка ядра</h3>
+            <p>Перед тем как загрузить ядро, надо помочь ему настроить среду.</p>
+            <p>
+                <xmp>
+# Объявиляем константы для мультизагрузочного заголовка. 
+.set ALIGN,    1<<0             # выравниваем загруженные модули по границам страницы 
+.set MEMINFO,  1<<1             # продоставляем карту памяти 
+.set FLAGS,    ALIGN | MEMINFO  # это поле предоставляет флаг мультизагрузки 
+.set MAGIC,    0x1BADB002       # магическое число позволяет загрузчику найти заголовок 
+.set CHECKSUM, -(MAGIC + FLAGS) # контрольная сумма чтобы показать что код мультизагрузочный
+
+# Объявить мультизагрузочный заголовок который отмечает программу как ядро. 
+.section .multiboot.data, "aw"
+.align 4
+.long MAGIC
+.long FLAGS
+.long CHECKSUM
+
+# Выделить начальный стек. 
+.section .bootstrap_stack, "aw", @nobits
+stack_bottom:
+.skip 16384 # 16 KiB
+stack_top:
+
+# Предварительно выделить страницы, используемые для разбиения на страницы. Не программируйте адреса жестко и не предполагайте, что они 
+# доступны, так как загрузчик мог загрузить 
+туда свои мультизагрузочные структуры или # модули. Это позволяет загрузчику знать, что он должен избегать адресов. 
+.section .bss, "aw", @nobits
+    .align 4096
+boot_page_directory:
+    .skip 4096
+boot_page_table1:
+    .skip 4096
+# Если размер ядра превышает 3 МБ, могут потребоваться дополнительные таблицы страниц. 
+
+# Точка входа в ядро. 
+.section .multiboot.text, "a"
+.global _start
+.type _start, @function
+_start:
+    # Физический адрес boot_page_table1.
+    movl $(boot_page_table1 - 0xC0000000), %edi
+
+    # Первый адрес для сопоставления - это адрес 0. 
+    movl $0, %esi
+    
+    # Отобразить 1023 страницы. 1024-й будет текстовым буфером VGA. 
+    movl $1023, %ecx
+
+1:
+    # Отображение только ядра. 
+    cmpl $_kernel_start, %esi
+    jl 2f
+    cmpl $(_kernel_end - 0xC0000000), %esi
+    jge 3f
+
+    # Сопоставьте физический адрес как "настоящий, доступный для записи". Обратите внимание, что это отображает 
+	# .text и .rodata как доступные для записи. Помните о безопасности и отметьте их как недоступные для записи. 
+    movl %esi, %edx
+    orl $0x003, %edx
+    movl %edx, (%edi)
+
+2:
+    # Размер страницы 4096 байт. 
+    addl $4096, %esi
+
+    # Размер записей в boot_page_table1 составляет 4 байта. 
+    addl $4, %edi
+
+    # Переходим к следующей записи, если мы еще не закончили. 
+    loop 1b
+
+3:
+    # Отображение видеопамяти VGA в 0xC03FF000 как «настоящее, доступное для записи».
+    movl $(0x000B8000 | 0x003), boot_page_table1 - 0xC0000000 + 1023 * 4
+
+    # Таблица страниц используется для обеих записей каталога страниц 0 (практически с 0x0
+	# на 0x3FFFFF) (таким образом, идентичность отображает ядро) и запись каталога страниц 
+	# 768 (фактически от 0xC0000000 до 0xC03FFFFF) (таким образом, отображая ее в 
+	верхней половине #). Ядро привязано к идентичности, потому что включение подкачки 
+	# не меняет следующую инструкцию, которая продолжает оставаться физической. 
+	Если не было сопоставления идентификаторов, CPU # вместо этого выдает ошибку страницы. 
+
+	# Сопоставьте таблицу страниц с обоими виртуальными адресами 0x00000000 и 0xC0000000. 
+    movl $(boot_page_table1 - 0xC0000000 + 0x003), boot_page_directory - 0xC0000000 + 0
+    movl $(boot_page_table1 - 0xC0000000 + 0x003), boot_page_directory - 0xC0000000 + 768 * 4
+
+    # Установите cr3 на адрес boot_page_directory. 
+    movl $(boot_page_directory - 0xC0000000), %ecx
+    movl %ecx, %cr3
+
+    # Разрешить разбиение на страницы и бит защиты от записи.
+    movl %cr0, %ecx
+    orl $0x80010000, %ecx
+    movl %ecx, %cr0
+
+    # Переход на higher half с абсолютным прыжком. 
+    lea 4f, %ecx
+    jmp *%ecx
+
+.section .text
+
+4:
+    # На этом этапе подкачка полностью настроена и включена. 
+
+    # Отмените отображение идентификатора, поскольку теперь в нем нет необходимости.  
+    movl $0, boot_page_directory + 0
+
+    # Перезагрузите crc3, чтобы принудительно очистить TLB, чтобы изменения вступили в силу. 
+	movl %cr3, %ecx
+    movl %ecx, %cr3
+
+    # Настраиваем стек.
+    mov $stack_top, %esp
+
+    # Открытие ядра.
+    call kernel_main
+
+    # Ой все))
+    cli
+1:	hlt
+    # Отключение ОС
+    outw 0x604, 0x2000
+    
+                </xmp>
+            </p>
+
+            <h3>Ядро на Си </h3>
+            <p>Перед тем как загрузить ядро, надо помочь ему настроить среду.</p>
+            <p>
+                <xmp>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+ 
+/* Цветовые константы аппаратного текстового режима. */
+enum vga_color {
+    VGA_COLOR_BLACK = 0,
+    VGA_COLOR_BLUE = 1,
+    VGA_COLOR_GREEN = 2,
+    VGA_COLOR_CYAN = 3,
+    VGA_COLOR_RED = 4,
+    VGA_COLOR_MAGENTA = 5,
+    VGA_COLOR_BROWN = 6,
+    VGA_COLOR_LIGHT_GREY = 7,
+    VGA_COLOR_DARK_GREY = 8,
+    VGA_COLOR_LIGHT_BLUE = 9,
+    VGA_COLOR_LIGHT_GREEN = 10,
+    VGA_COLOR_LIGHT_CYAN = 11,
+    VGA_COLOR_LIGHT_RED = 12,
+    VGA_COLOR_LIGHT_MAGENTA = 13,
+    VGA_COLOR_LIGHT_YELLOW = 14,
+    VGA_COLOR_WHITE = 15,
+};
+ 
+static inline uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg) 
+{
+    return fg | bg << 4;
+}
+ 
+static inline uint16_t vga_entry(unsigned char uc, uint8_t color) 
+{
+    return (uint16_t) uc | (uint16_t) color << 8;
+}
+ 
+size_t strlen(const char* str) 
+{
+    size_t len = 0;
+    while (str[len])
+        len++;
+    return len;
+}
+ 
+static const size_t VGA_WIDTH = 80;
+static const size_t VGA_HEIGHT = 25;
+ 
+size_t terminal_row;
+size_t terminal_column;
+uint8_t terminal_color;
+uint16_t* terminal_buffer;
+ 
+void terminal_initialize(void) 
+{
+    terminal_row = 0;
+    terminal_column = 0;
+    terminal_color = vga_entry_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    terminal_buffer = (uint16_t*) 0xB8000;
+    for (size_t y = 0; y < VGA_HEIGHT; y++) {
+        for (size_t x = 0; x < VGA_WIDTH; x++) {
+            const size_t index = y * VGA_WIDTH + x;
+            terminal_buffer[index] = vga_entry(' ', terminal_color);
+        }
+    }
+}
+ 
+void terminal_setcolor(uint8_t color) 
+{
+    terminal_color = color;
+}
+ 
+void terminal_putentryat(char c, uint8_t color, size_t x, size_t y) 
+{
+    const size_t index = y * VGA_WIDTH + x;
+    terminal_buffer[index] = vga_entry(c, color);
+}
+ 
+void terminal_putchar(char c) 
+{
+    terminal_putentryat(c, terminal_color, terminal_column, terminal_row);
+    if (++terminal_column == VGA_WIDTH) {
+        terminal_column = 0;
+        if (++terminal_row == VGA_HEIGHT)
+            terminal_row = 0;
+    }
+}
+ 
+void terminal_write(const char* data, size_t size) 
+{
+    for (size_t i = 0; i < size; i++)
+        terminal_putchar(data[i]);
+}
+ 
+void terminal_writestring(const char* data) 
+{
+    terminal_write(data, strlen(data));
+}
+ 
+void kernel_main(void) 
+{
+    /* Инициализировать интерфейс терминала */
+    terminal_initialize();
+ 
+    /* Поддержка новой строки оставлена ​​в качестве упражнения. */
+    terminal_writestring("Hello, kernel World!\n");
+
+    /* Бесконечный цикл, для того чтобы увидеть результат */
+    while(1);
+}
+                </xmp>
+            </p>
+
+            <h3>Сборка и запуск</h3>
+            <p>Скомпилировать, используя:</p>
+            <p>
+                <xmp>
+i686-elf-gcc -c kernel.c -o kernel.o -std = gnu99 -ffreestanding  -O2  -Wall  -Wextra
+i686-elf-as boot.s -o boot.o
+i686-elf-gcc -T linker.ld -o myos.bin -ffreestanding -O2 -nostdlib boot.o kernel.o -lgcc
+                </xmp>
+            </p>
+            <p>Запуск:</p>
+            <xmp>
+qemu-system-i386 -kernel myos.bin
+            </xmp>
+
+            
+        </div>
+        
+    </body>
+</html>
